@@ -1,290 +1,335 @@
+"""Command-line interface (Python Fire) of the RAG system."""
 from __future__ import annotations
-from .utils import Utils
+
+import functools
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, ParamSpec, Tuple
+
+from pydantic import BaseModel
+from tqdm import tqdm
+
 from .models import (
-    RagDataset,
+    AnsweredQuestion,
+    MinimalAnswer,
     MinimalSearchResults,
     MinimalSource,
-    MinimalAnswer,
+    RagDataset,
     StudentSearchResults,
     StudentSearchResultsAndAnswer,
 )
-from .llm import LLM
-from pathlib import Path
-import bm25s
-import json
-import os
-from tqdm import tqdm
-from .models import AnsweredQuestion
+from .utils import Retriever, Utils
+
+P = ParamSpec("P")
+
+MAX_CONTEXT_CHARS = 9000
+IOU_THRESHOLD = 0.05
+
+
+def _safe(func: Callable[P, None]) -> Callable[P, None]:
+    """Turn any exception into a clean error message (no traceback)."""
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        try:
+            func(*args, **kwargs)
+        except KeyboardInterrupt:
+            print("[ERROR] Interrupted", file=sys.stderr)
+            raise SystemExit(130) from None
+        except Exception as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+
+    return wrapper
+
+
+def _check_k(k: Any) -> int:
+    """Validate the top-k argument."""
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        raise ValueError("k must be a positive integer")
+    return k
+
+
+def _check_query(query: Any) -> str:
+    """Validate a query (Fire may parse '123' as an int)."""
+    if query is None or not str(query).strip():
+        raise ValueError("The query is empty")
+    return str(query)
+
+
+def _check_json(path: Any, name: str) -> str:
+    """Validate a path to an existing .json file."""
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{name} must be a non-empty path")
+    if not path.endswith(".json"):
+        raise ValueError(f"{name}: only .json files are accepted")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{name}: file not found: {path}")
+    return path
+
+
+def _check_dir(path: Any, name: str) -> str:
+    """Validate an output directory argument."""
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{name} must be a non-empty path")
+    return path
+
+
+def _save(model: BaseModel, directory: str, basename: str) -> Path:
+    """Write a pydantic model as JSON in ``directory``."""
+    out_dir = Path(directory)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / basename
+    out_path.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+    return out_path
+
+
+def _build_context(blocks: List[Tuple[str, str]]) -> str:
+    """Format snippets for the prompt within a character budget."""
+    parts: List[str] = []
+    used = 0
+    for i, (label, text) in enumerate(blocks, 1):
+        room = MAX_CONTEXT_CHARS - used
+        if room <= 200:
+            break
+        snippet = text[:room]
+        parts.append(f"[{i}] {label}\n{snippet}")
+        used += len(snippet)
+    return "\n\n---\n\n".join(parts)
+
+
+def _iou(a: MinimalSource, b: MinimalSource) -> float:
+    """Intersection over union of two character ranges."""
+    inter = min(a.last_character_index, b.last_character_index) - max(
+        a.first_character_index, b.first_character_index
+    )
+    if inter <= 0:
+        return 0.0
+    union = (
+        (a.last_character_index - a.first_character_index)
+        + (b.last_character_index - b.first_character_index)
+        - inter
+    )
+    return inter / union if union > 0 else 0.0
 
 
 class Arguments:
-    @staticmethod
-    def _overlap(a: MinimalSource, b: MinimalSource) -> bool:
-        return not (
-            a.last_character_index <= b.first_character_index
-            or b.last_character_index <= a.first_character_index
-        )
+    """RAG commands: index, search, search_dataset, answer, ..."""
 
-    def index(self, max_chunk_size: int) -> None:
-        if not isinstance(max_chunk_size, int):
-            raise ValueError("Error: your max_chunk must be a number")
-        if max_chunk_size < 200:
-            raise ValueError(
-                f"Got a larger chunk overlap (200) than chunk size "
-                f"{max_chunk_size}, should be smaller."
-            )
-
-        path = "data/raw/"
-        files = Utils().list_valid_path(path, ".txt", ".md", ".py")
-        chunks = Utils().documents_chunkers(files, max_chunk_size)
-        corpus = [chunk.page_content for chunk in chunks]
-
-        metadata = []
-        for chunk in chunks:
-            source = chunk.metadata.get("source", "unknown")
-            start = chunk.metadata.get("start_index", 0)
-            end = start + len(chunk.page_content)
-            metadata.append({
-                "source": source,
-                "first_character_index": start,
-                "last_character_index": end,
-                "extension": chunk.metadata.get("extension", ""),
-            })
-
-        tokens_corpus = bm25s.tokenize(
-            corpus, lower=True, show_progress=True, stopwords="en"
-        )
-        retriever = bm25s.BM25()
-        retriever.index(tokens_corpus)
-
-        out_dir = Path("data/processed")
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        retriever.save(str(out_dir), corpus=corpus)
-
-        (out_dir / "corpus.json").write_text(
-            json.dumps(corpus, ensure_ascii=False), encoding="utf-8"
-        )
-        (out_dir / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
-        )
-
-        print("Ingestion complete! Indices saved under data/processed/")
-
-    def search(self, query: str, k: int) -> None:
-        if not isinstance(query, str) or not isinstance(k, int):
-            raise ValueError("[ERROR]You must include the valid type")
-        if not query:
-            raise ValueError("[ERROR]No query is added")
-        if not k:
-            raise ValueError("[ERROR]No top-k is added")
-
-        utils = Utils()
-        retriever, metadata = utils.load_retriever("data/processed/")
-        results, _ = utils.retrieve_result(retriever, query, k)
-
-        for item in results[0]:
-            _, meta, _ = utils.extract_hit(retriever, metadata, item)
-            location = (
-                f"{meta['source']} "
-                f"[{meta['first_character_index']}:"
-                f"{meta['last_character_index']}]"
-            )
-            print(location)
-
-    def search_dataset(
-        self, dataset_path: str, k: int, save_directory: str
+    @_safe
+    def index(
+        self,
+        max_chunk_size: int = 2000,
+        raw_dir: str = "data/raw",
+        index_dir: str = "data/processed",
     ) -> None:
-        if not all(isinstance(x, t) for x, t in [
-            (dataset_path, str), (k, int), (save_directory, str)
-        ]):
-            raise ValueError("[ERROR]You must include the valid type")
-        if not dataset_path:
-            raise ValueError("[ERROR]No dataset_path is added")
-        if not k:
-            raise ValueError("[ERROR]No top-k is added")
-        if not save_directory:
-            raise ValueError("[ERROR]No save_directory is added")
-        if not dataset_path.endswith(".json"):
-            raise ValueError("[ERROR]Only json files are authorized")
-
-        basename = os.path.basename(dataset_path)
-        with open(dataset_path, encoding="utf-8") as f:
-            json_loader = json.load(f)
-        validate_data = RagDataset.model_validate(json_loader)
-
-        utils = Utils()
-        retriever, metadata = utils.load_retriever("data/processed/")
-
-        search_results: list[MinimalSearchResults] = []
-
-        for question in validate_data.rag_questions:
-            results, _ = utils.retrieve_result(
-                retriever, question.question, k
-            )
-
-            retrieved_sources = []
-            for item in results[0]:
-                _, meta, _ = utils.extract_hit(retriever, metadata, item)
-                retrieved_sources.append(
-                    MinimalSource(
-                        file_path=meta["source"],
-                        first_character_index=meta["first_character_index"],
-                        last_character_index=meta["last_character_index"],
-                    )
-                )
-
-            search_results.append(
-                MinimalSearchResults(
-                    question_id=question.question_id,
-                    question=question.question,
-                    retrieved_sources=retrieved_sources,
-                )
-            )
-
-        output = StudentSearchResults(search_results=search_results, k=k)
-        out_dir = Path(save_directory)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / basename
-        out_path.write_text(
-            output.model_dump_json(indent=2), encoding="utf-8"
-        )
-        print(f"Saved student_search_results to {out_path}")
-
-    def answer(self, query: str, k: int = 5) -> None:
-        if not isinstance(query, str) or not isinstance(k, int):
-            raise ValueError("[ERROR]You must include the valid type")
-        if not query:
-            raise ValueError("[ERROR]No question is added")
-        if not k:
-            raise ValueError("[ERROR]No top-k is added")
-
-        utils = Utils()
-        retriever, metadata = utils.load_retriever("data/processed/")
-        results, _ = utils.retrieve_result(retriever, query, k)
-
-        context_parts = []
-        for item in tqdm(results[0], desc="retrieve", unit=" file"):
-            _, meta, chunk_text = utils.extract_hit(
-                retriever, metadata, item
-            )
-            context_parts.append(
-                f"Source: {meta['source']} "
-                f"[{meta['first_character_index']}:"
-                f"{meta['last_character_index']}]\n"
-                f"{chunk_text}"
-            )
-        context = "\n\n---\n\n".join(context_parts)
-
-        answer = LLM().ask_llm(question=query, context=context)
-        print(answer)
-
-    def answer_dataset(
-        self, dataset_path: str, k: int, save_directory: str
-    ) -> None:
-        if not all(isinstance(x, t) for x, t in [
-            (dataset_path, str), (k, int), (save_directory, str)
-        ]):
-            raise ValueError("[ERROR]You must include the valid type")
-        if not dataset_path:
-            raise ValueError("[ERROR]No dataset_path is added")
-        if not k:
-            raise ValueError("[ERROR]No top-k is added")
-        if not save_directory:
-            raise ValueError("[ERROR]No save_directory is added")
-        if not dataset_path.endswith(".json"):
-            raise ValueError("[ERROR]Only json files are authorized")
-
-        basename = os.path.basename(dataset_path)
-        with open(dataset_path, encoding="utf-8") as f:
-            json_loader = json.load(f)
-        validate_data = RagDataset.model_validate(json_loader)
-
-        utils = Utils()
-        retriever, metadata = utils.load_retriever("data/processed/")
-        llm = LLM()
-
-        answers: list[MinimalAnswer] = []
-
-        for question in tqdm(
-            validate_data.rag_questions, desc="answer", unit=" q"
+        """Ingest ``raw_dir`` and build the BM25 index in ``index_dir``."""
+        if isinstance(max_chunk_size, bool) or not isinstance(
+            max_chunk_size, int
         ):
-            results, _ = utils.retrieve_result(
-                retriever, question.question, k
-            )
-
-            retrieved_sources = []
-            context_parts = []
-            for item in results[0]:
-                _, meta, chunk_text = utils.extract_hit(
-                    retriever, metadata, item
-                )
-                retrieved_sources.append(
-                    MinimalSource(
-                        file_path=meta["source"],
-                        first_character_index=meta["first_character_index"],
-                        last_character_index=meta["last_character_index"],
-                    )
-                )
-                context_parts.append(chunk_text)
-
-            context = "\n\n---\n\n".join(context_parts)
-            answer = llm.ask_llm(
-                question=question.question, context=context
-            )
-
-            answers.append(
-                MinimalAnswer(
-                    question_id=question.question_id,
-                    question=question.question,
-                    retrieved_sources=retrieved_sources,
-                    answer=answer,
-                )
-            )
-
-        output = StudentSearchResultsAndAnswer(
-            search_results=answers, k=k
+            raise ValueError("max_chunk_size must be an integer")
+        if not 100 <= max_chunk_size <= 2000:
+            raise ValueError("max_chunk_size must be between 100 and 2000")
+        _check_dir(raw_dir, "raw_dir")
+        _check_dir(index_dir, "index_dir")
+        count = Utils().build_index(raw_dir, index_dir, max_chunk_size)
+        print(
+            f"Ingestion complete! Indexed {count} chunks under "
+            f"{index_dir.rstrip('/')}/"
         )
-        out_dir = Path(save_directory)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / basename
-        out_path.write_text(
-            output.model_dump_json(indent=2), encoding="utf-8"
-        )
-        print(f"Saved student_answers to {out_path}")
 
-    def evaluate(self, student_search_results_path: str, dataset_path: str):
-        if not (isinstance(student_search_results_path, str)
-                and isinstance(dataset_path, str)):
-            raise ValueError("[ERROR]You must include the valid type")
+    @_safe
+    def search(
+        self, query: str, k: int = 10, index_dir: str = "data/processed"
+    ) -> None:
+        """Print the top-k sources for a single query."""
+        query = _check_query(query)
+        k = _check_k(k)
+        for c in Retriever(index_dir).search(query, k):
+            print(
+                f"{c.source} "
+                f"[{c.first_character_index}:{c.last_character_index}]"
+            )
 
-        with open(student_search_results_path, encoding="utf-8") as f:
-            student = StudentSearchResults.model_validate(json.load(f))
+    @_safe
+    def search_dataset(
+        self,
+        dataset_path: str,
+        k: int,
+        save_directory: str,
+        index_dir: str = "data/processed",
+    ) -> None:
+        """Search a whole dataset and write a StudentSearchResults JSON."""
+        dataset_path = _check_json(dataset_path, "dataset_path")
+        k = _check_k(k)
+        save_directory = _check_dir(save_directory, "save_directory")
         with open(dataset_path, encoding="utf-8") as f:
             dataset = RagDataset.model_validate(json.load(f))
+        retriever = Retriever(index_dir)
 
-        gt: dict[str, list[MinimalSource]] = {
+        results: List[MinimalSearchResults] = []
+        for q in tqdm(dataset.rag_questions, desc="Searching", unit=" q"):
+            hits = retriever.search(q.question, k)
+            results.append(
+                MinimalSearchResults(
+                    question_id=q.question_id,
+                    question=q.question,
+                    retrieved_sources=[
+                        MinimalSource(
+                            file_path=c.source,
+                            first_character_index=c.first_character_index,
+                            last_character_index=c.last_character_index,
+                        )
+                        for c in hits
+                    ],
+                )
+            )
+        out = _save(
+            StudentSearchResults(search_results=results, k=k),
+            save_directory,
+            os.path.basename(dataset_path),
+        )
+        print(f"Saved student_search_results to {out}")
+
+    @_safe
+    def answer(
+        self, query: str, k: int = 5, index_dir: str = "data/processed"
+    ) -> None:
+        """Answer a single query using the retrieved context."""
+        query = _check_query(query)
+        k = _check_k(k)
+        hits = Retriever(index_dir).search(query, k)
+        if not hits:
+            print("No relevant context found for this question.")
+            return
+        context = _build_context(
+            [
+                (
+                    f"{c.source} [{c.first_character_index}:"
+                    f"{c.last_character_index}]",
+                    c.text,
+                )
+                for c in hits
+            ]
+        )
+        from .llm import LLM
+
+        print(LLM().ask_llm(question=query, context=context))
+
+    @_safe
+    def answer_dataset(
+        self, student_search_results_path: str, save_directory: str
+    ) -> None:
+        """Generate answers from a StudentSearchResults JSON file."""
+        path = _check_json(
+            student_search_results_path, "student_search_results_path"
+        )
+        save_directory = _check_dir(save_directory, "save_directory")
+        with open(path, encoding="utf-8") as f:
+            student = StudentSearchResults.model_validate(json.load(f))
+
+        from .llm import LLM
+
+        llm = LLM()
+        utils = Utils()
+        cache: Dict[str, Optional[str]] = {}
+
+        def source_text(src: MinimalSource) -> Optional[str]:
+            """Read the text of a source from the corpus (cached)."""
+            if src.file_path not in cache:
+                try:
+                    cache[src.file_path] = utils.read_text(src.file_path)
+                except OSError:
+                    cache[src.file_path] = None
+            full = cache[src.file_path]
+            if full is None:
+                return None
+            return full[
+                src.first_character_index:src.last_character_index
+            ]
+
+        answers: List[MinimalAnswer] = []
+        for res in tqdm(student.search_results, desc="Answering", unit=" q"):
+            blocks: List[Tuple[str, str]] = []
+            for src in res.retrieved_sources:
+                text = source_text(src)
+                if text:
+                    blocks.append(
+                        (
+                            f"{src.file_path} [{src.first_character_index}:"
+                            f"{src.last_character_index}]",
+                            text,
+                        )
+                    )
+            if blocks:
+                reply = llm.ask_llm(
+                    question=res.question, context=_build_context(blocks)
+                )
+            else:
+                reply = "No relevant context found for this question."
+            answers.append(
+                MinimalAnswer(
+                    question_id=res.question_id,
+                    question=res.question,
+                    retrieved_sources=res.retrieved_sources,
+                    answer=reply,
+                )
+            )
+        out = _save(
+            StudentSearchResultsAndAnswer(
+                search_results=answers, k=student.k
+            ),
+            save_directory,
+            os.path.basename(path),
+        )
+        print(f"Saved student_search_results_and_answer to {out}")
+
+    @_safe
+    def evaluate(
+        self, student_search_results_path: str, dataset_path: str
+    ) -> None:
+        """Compute recall@k (IoU > 0.05) against a ground-truth dataset."""
+        sp = _check_json(
+            student_search_results_path, "student_search_results_path"
+        )
+        dp = _check_json(dataset_path, "dataset_path")
+        with open(sp, encoding="utf-8") as f:
+            student = StudentSearchResults.model_validate(json.load(f))
+        with open(dp, encoding="utf-8") as f:
+            dataset = RagDataset.model_validate(json.load(f))
+
+        truth: Dict[str, List[MinimalSource]] = {
             q.question_id: q.sources
             for q in dataset.rag_questions
             if isinstance(q, AnsweredQuestion) and q.sources
         }
-
-        recalls: list[float] = []
+        cutoffs = sorted({c for c in (1, 3, 5, 10, student.k)
+                          if c <= student.k})
+        scores: Dict[int, List[float]] = {c: [] for c in cutoffs}
         for res in student.search_results:
-            truth = gt.get(res.question_id)
-            if not truth:
+            gt = truth.get(res.question_id)
+            if not gt:
                 continue
+            for c in cutoffs:
+                top = res.retrieved_sources[:c]
+                found = sum(
+                    1
+                    for t in gt
+                    if any(
+                        r.file_path == t.file_path
+                        and _iou(t, r) > IOU_THRESHOLD
+                        for r in top
+                    )
+                )
+                scores[c].append(found / len(gt))
 
-            hits = 0
-            for t in truth:
-                if any(
-                    r.file_path == t.file_path and self._overlap(t, r)
-                    for r in res.retrieved_sources
-                ):
-                    hits += 1
-
-            recalls.append(hits / len(truth))
-
-        avg = sum(recalls) / len(recalls) if recalls else 0.0
-        print(f"Recall@{student.k} = {avg:.4f}  ({len(recalls)} questions)")
-        return avg
+        n = len(scores[cutoffs[0]])
+        print(f"Questions evaluated: {n}")
+        print(
+            "  ".join(
+                f"Recall@{c}: {(sum(v) / n if n else 0.0):.3f}"
+                for c, v in scores.items()
+            )
+        )
