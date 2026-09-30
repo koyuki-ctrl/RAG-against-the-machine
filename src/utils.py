@@ -1,11 +1,12 @@
 """Corpus discovery, chunking, tokenization and BM25 retrieval."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import bm25s
 from langchain_core.documents import Document
@@ -15,6 +16,7 @@ from langchain_text_splitters import (
 )
 from tqdm import tqdm
 
+from .cache import DiskCache, index_version, make_key
 from .models import IndexedChunk
 
 STOPWORDS = frozenset(
@@ -218,26 +220,56 @@ class Utils:
                 )
         return chunks
 
-    def build_index(
-        self, raw_dir: str, index_dir: str, max_chunk_size: int
-    ) -> int:
-        """Chunk the corpus, build a BM25 index and persist it.
+    @staticmethod
+    def file_hash(path: str) -> str:
+        """Compute the SHA-256 of a file (used to detect changes).
 
         Args:
-            raw_dir: Corpus directory.
-            index_dir: Where the index is written.
-            max_chunk_size: Maximum chunk size in characters.
+            path: File path.
 
         Returns:
-            Number of indexed chunks.
+            Hexadecimal digest.
         """
-        files = self.list_valid_path(raw_dir, ".txt", ".md", ".py")
-        if not files:
-            raise FileNotFoundError(f"No .txt/.md/.py file in {raw_dir}")
-        chunks = self.documents_chunkers(files, max_chunk_size)
-        if not chunks:
-            raise ValueError("The corpus produced no chunk")
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
+    def _hash_files(self, files: List[str]) -> Dict[str, str]:
+        """Hash every file, skipping the unreadable ones.
+
+        Args:
+            files: File paths.
+
+        Returns:
+            Mapping ``path -> sha256``.
+        """
+        hashes: Dict[str, str] = {}
+        for path in tqdm(files, desc="Hashing", unit=" file"):
+            try:
+                hashes[path] = self.file_hash(path)
+            except OSError as exc:
+                tqdm.write(f"[WARN] skipped {path}: {exc}")
+        return hashes
+
+    @staticmethod
+    def _save_index(
+        chunks: List[IndexedChunk],
+        index_dir: str,
+        max_chunk_size: int,
+        hashes: Dict[str, str],
+    ) -> None:
+        """Tokenize, build the BM25 index and persist everything.
+
+        Writes the BM25 files, ``chunks.json`` and ``manifest.json``.
+
+        Args:
+            chunks: All chunks of the corpus (in file order).
+            index_dir: Output directory.
+            max_chunk_size: Chunk size used to build the chunks.
+            hashes: ``path -> sha256`` of every indexed file.
+        """
         corpus_tokens = [
             tokenize(f"{c.source}\n{c.breadcrumb}\n{c.text}")
             for c in tqdm(chunks, desc="Tokenizing", unit=" chunk")
@@ -251,35 +283,179 @@ class Utils:
         with open(out / "chunks.json", "w", encoding="utf-8") as f:
             json.dump([c.model_dump() for c in chunks], f,
                       ensure_ascii=False)
+        with open(out / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {"max_chunk_size": max_chunk_size, "files": hashes}, f
+            )
+
+    def build_index(
+        self, raw_dir: str, index_dir: str, max_chunk_size: int
+    ) -> int:
+        """Chunk the whole corpus, build a BM25 index and persist it.
+
+        Args:
+            raw_dir: Corpus directory.
+            index_dir: Where the index is written.
+            max_chunk_size: Maximum chunk size in characters.
+
+        Returns:
+            Number of indexed chunks.
+        """
+        files = self.list_valid_path(raw_dir, ".txt", ".md", ".py")
+        if not files:
+            raise FileNotFoundError(f"No .txt/.md/.py file in {raw_dir}")
+        hashes = self._hash_files(files)
+        chunks = self.documents_chunkers(list(hashes), max_chunk_size)
+        if not chunks:
+            raise ValueError("The corpus produced no chunk")
+        self._save_index(chunks, index_dir, max_chunk_size, hashes)
         return len(chunks)
+
+    def update_index(
+        self,
+        raw_dir: str,
+        index_dir: str,
+        max_chunk_size: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Incrementally update an existing index.
+
+        Only new and modified files are re-read and re-chunked. Chunks
+        of unchanged files are reused as-is and chunks of deleted files
+        are dropped. BM25 is then rebuilt from the chunks, which gives
+        exactly the same index as a full rebuild.
+
+        Args:
+            raw_dir: Corpus directory.
+            index_dir: Directory of the existing index.
+            max_chunk_size: New chunk size; None keeps the current one
+                (a different value re-chunks every file).
+
+        Returns:
+            Counters: added, modified, deleted, unchanged, chunks.
+
+        Raises:
+            FileNotFoundError: If no index exists yet.
+        """
+        out = Path(index_dir)
+        manifest_file = out / "manifest.json"
+        chunks_file = out / "chunks.json"
+        if not manifest_file.is_file() or not chunks_file.is_file():
+            raise FileNotFoundError(
+                f"No index in {index_dir}: run the 'index' command first"
+            )
+        with open(manifest_file, encoding="utf-8") as f:
+            manifest = json.load(f)
+        old_hashes: Dict[str, str] = manifest["files"]
+        size = int(manifest["max_chunk_size"])
+        rechunk_all = max_chunk_size is not None and max_chunk_size != size
+        if max_chunk_size is not None:
+            size = max_chunk_size
+
+        files = self.list_valid_path(raw_dir, ".txt", ".md", ".py")
+        new_hashes = self._hash_files(files)
+        added = [f for f in new_hashes if f not in old_hashes]
+        modified = [
+            f for f in new_hashes
+            if f in old_hashes
+            and (rechunk_all or new_hashes[f] != old_hashes[f])
+        ]
+        deleted = [f for f in old_hashes if f not in new_hashes]
+
+        with open(chunks_file, encoding="utf-8") as f:
+            old_chunks = [
+                IndexedChunk.model_validate(c) for c in json.load(f)
+            ]
+        stats = {
+            "added": len(added),
+            "modified": len(modified),
+            "deleted": len(deleted),
+            "unchanged": len(new_hashes) - len(added) - len(modified),
+            "chunks": len(old_chunks),
+        }
+        if not (added or modified or deleted):
+            return stats
+
+        redo = set(added) | set(modified)
+        by_source: Dict[str, List[IndexedChunk]] = {}
+        for c in old_chunks:
+            if c.source in new_hashes and c.source not in redo:
+                by_source.setdefault(c.source, []).append(c)
+        if redo:
+            for c in self.documents_chunkers(sorted(redo), size):
+                by_source.setdefault(c.source, []).append(c)
+        chunks = [c for path in sorted(by_source) for c in by_source[path]]
+        if not chunks:
+            raise ValueError("The corpus produced no chunk")
+
+        self._save_index(chunks, index_dir, size, new_hashes)
+        stats["chunks"] = len(chunks)
+        return stats
 
 
 class Retriever:
-    """BM25 retriever over the persisted index."""
+    """BM25 retriever over the persisted index, with optional caching."""
 
-    def __init__(self, index_dir: str = "data/processed") -> None:
+    def __init__(
+        self,
+        index_dir: str = "data/processed",
+        cache: Optional[DiskCache] = None,
+    ) -> None:
         """Load the index once.
 
         Args:
             index_dir: Directory written by ``Utils.build_index``.
+            cache: Optional cache (fast chunk loading + query results).
 
         Raises:
             FileNotFoundError: If the index does not exist.
         """
         path = Path(index_dir)
-        chunks_file = path / "chunks.json"
-        if not chunks_file.is_file():
+        if not (path / "chunks.json").is_file():
             raise FileNotFoundError(
                 f"No index in {index_dir}: run the 'index' command first"
             )
-        with open(chunks_file, encoding="utf-8") as f:
-            self.chunks = [
-                IndexedChunk.model_validate(c) for c in json.load(f)
-            ]
-        self.bm25 = bm25s.BM25.load(str(path))
+        self.cache = cache
+        self.hits = 0
+        self.misses = 0
+        self._memory: Dict[str, List[int]] = {}
+        self.version = index_version(path)
+        self.chunks = self._load_chunks(path)
+        try:
+            self.bm25 = bm25s.BM25.load(str(path), mmap=True)
+        except (OSError, ValueError):
+            self.bm25 = bm25s.BM25.load(str(path))
+
+    def _load_chunks(self, path: Path) -> List[IndexedChunk]:
+        """Load chunks, from the fast cached copy when it is valid."""
+        name = f"chunks-{self.version}"
+        if self.cache is not None:
+            stored = self.cache.load_pickle(name)
+            if isinstance(stored, list):
+                try:
+                    return [IndexedChunk.model_construct(**d) for d in stored]
+                except TypeError:
+                    pass
+        with open(path / "chunks.json", encoding="utf-8") as f:
+            chunks = [IndexedChunk.model_validate(c) for c in json.load(f)]
+        if self.cache is not None:
+            self.cache.save_pickle(name, [c.model_dump() for c in chunks])
+            self.cache.purge("chunks-", keep=name)
+        return chunks
+
+    def _search_ids(self, query: str, k: int) -> List[int]:
+        """Run the real BM25 search and return chunk ids."""
+        tokens = [t for t in tokenize(query) if t in self.bm25.vocab_dict]
+        if not tokens:
+            return []
+        k = min(k, len(self.chunks))
+        results, _ = self.bm25.retrieve([tokens], k=k, show_progress=False)
+        return [int(i) for i in results[0]]
 
     def search(self, query: str, k: int) -> List[IndexedChunk]:
-        """Return the top-k chunks for a query.
+        """Return the top-k chunks for a query (cached when possible).
+
+        The cache key contains the normalised query, ``k`` and the index
+        version, so an ``index`` or ``update`` invalidates old results.
 
         Args:
             query: Natural-language question.
@@ -288,11 +464,24 @@ class Retriever:
         Returns:
             Chunks ranked by decreasing BM25 score (may be empty).
         """
-        tokens = [t for t in tokenize(query) if t in self.bm25.vocab_dict]
-        if not tokens:
-            return []
-        k = min(k, len(self.chunks))
-        results, _ = self.bm25.retrieve(
-            [tokens], k=k, show_progress=False
-        )
-        return [self.chunks[int(i)] for i in results[0]]
+        ids: Optional[List[int]] = None
+        key = make_key(self.version, str(k), " ".join(query.lower().split()))
+        if self.cache is not None:
+            ids = self._memory.get(key)
+            if ids is None:
+                stored = self.cache.get(key)
+                if isinstance(stored, list) and all(
+                    isinstance(i, int) and 0 <= i < len(self.chunks)
+                    for i in stored
+                ):
+                    ids = stored
+        if ids is not None:
+            self.hits += 1
+        else:
+            self.misses += 1
+            ids = self._search_ids(query, k)
+            if self.cache is not None:
+                self.cache.set(key, ids)
+        if self.cache is not None:
+            self._memory[key] = ids
+        return [self.chunks[i] for i in ids]

@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, ParamSpec, Tuple
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from .cache import DiskCache
+from .llm import LLM
 from .models import (
     AnsweredQuestion,
     MinimalAnswer,
@@ -70,11 +72,44 @@ def _check_json(path: Any, name: str) -> str:
     return path
 
 
+def _check_chunk_size(value: Any) -> int:
+    """Validate --max_chunk_size (moulinette limit: 2000 characters)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_chunk_size must be an integer")
+    if not 100 <= value <= 2000:
+        raise ValueError("max_chunk_size must be between 100 and 2000")
+    return value
+
+
 def _check_dir(path: Any, name: str) -> str:
     """Validate an output directory argument."""
     if not isinstance(path, str) or not path:
         raise ValueError(f"{name} must be a non-empty path")
     return path
+
+
+def _make_cache(no_cache: bool, cache_dir: str) -> Optional[DiskCache]:
+    """Create the cache unless it is disabled with --no_cache."""
+    if no_cache:
+        return None
+    return DiskCache(_check_dir(cache_dir, "cache_dir"))
+
+
+def _report(
+    retriever: Optional[Retriever] = None, llm: Optional[LLM] = None
+) -> None:
+    """Print cache statistics on stderr and prune old entries."""
+    parts: List[str] = []
+    if retriever is not None and retriever.cache is not None:
+        parts.append(
+            f"search {retriever.hits} hit(s)/{retriever.misses} miss(es)"
+        )
+        retriever.cache.prune()
+    if llm is not None and llm.cache is not None:
+        parts.append(f"llm {llm.hits} hit(s)/{llm.misses} miss(es)")
+        llm.cache.prune()
+    if parts:
+        print("[cache] " + ", ".join(parts), file=sys.stderr)
 
 
 def _save(model: BaseModel, directory: str, basename: str) -> Path:
@@ -126,12 +161,7 @@ class Arguments:
         index_dir: str = "data/processed",
     ) -> None:
         """Ingest ``raw_dir`` and build the BM25 index in ``index_dir``."""
-        if isinstance(max_chunk_size, bool) or not isinstance(
-            max_chunk_size, int
-        ):
-            raise ValueError("max_chunk_size must be an integer")
-        if not 100 <= max_chunk_size <= 2000:
-            raise ValueError("max_chunk_size must be between 100 and 2000")
+        _check_chunk_size(max_chunk_size)
         _check_dir(raw_dir, "raw_dir")
         _check_dir(index_dir, "index_dir")
         count = Utils().build_index(raw_dir, index_dir, max_chunk_size)
@@ -141,17 +171,50 @@ class Arguments:
         )
 
     @_safe
+    def update(
+        self,
+        max_chunk_size: Optional[int] = None,
+        raw_dir: str = "data/raw",
+        index_dir: str = "data/processed",
+    ) -> None:
+        """Incrementally re-index only new, modified or deleted files."""
+        if max_chunk_size is not None:
+            _check_chunk_size(max_chunk_size)
+        _check_dir(raw_dir, "raw_dir")
+        _check_dir(index_dir, "index_dir")
+        st = Utils().update_index(raw_dir, index_dir, max_chunk_size)
+        if not (st["added"] or st["modified"] or st["deleted"]):
+            print(
+                f"Index already up to date ({st['unchanged']} files "
+                f"unchanged, {st['chunks']} chunks)"
+            )
+            return
+        print(
+            f"Update complete! {st['added']} added, {st['modified']} "
+            f"modified, {st['deleted']} deleted, {st['unchanged']} "
+            f"unchanged. Indexed {st['chunks']} chunks under "
+            f"{index_dir.rstrip('/')}/"
+        )
+
+    @_safe
     def search(
-        self, query: str, k: int = 10, index_dir: str = "data/processed"
+        self,
+        query: str,
+        k: int = 10,
+        index_dir: str = "data/processed",
+        no_cache: bool = False,
+        cache_dir: str = "data/cache",
     ) -> None:
         """Print the top-k sources for a single query."""
         query = _check_query(query)
         k = _check_k(k)
-        for c in Retriever(index_dir).search(query, k):
+        retriever = Retriever(index_dir, _make_cache(no_cache, cache_dir))
+        for c in retriever.search(query, k):
             print(
                 f"{c.source} "
                 f"[{c.first_character_index}:{c.last_character_index}]"
             )
+        _report(retriever)
 
     @_safe
     def search_dataset(
@@ -160,6 +223,8 @@ class Arguments:
         k: int,
         save_directory: str,
         index_dir: str = "data/processed",
+        no_cache: bool = False,
+        cache_dir: str = "data/cache",
     ) -> None:
         """Search a whole dataset and write a StudentSearchResults JSON."""
         dataset_path = _check_json(dataset_path, "dataset_path")
@@ -167,7 +232,7 @@ class Arguments:
         save_directory = _check_dir(save_directory, "save_directory")
         with open(dataset_path, encoding="utf-8") as f:
             dataset = RagDataset.model_validate(json.load(f))
-        retriever = Retriever(index_dir)
+        retriever = Retriever(index_dir, _make_cache(no_cache, cache_dir))
 
         results: List[MinimalSearchResults] = []
         for q in tqdm(dataset.rag_questions, desc="Searching", unit=" q"):
@@ -192,15 +257,23 @@ class Arguments:
             os.path.basename(dataset_path),
         )
         print(f"Saved student_search_results to {out}")
+        _report(retriever)
 
     @_safe
     def answer(
-        self, query: str, k: int = 5, index_dir: str = "data/processed"
+        self,
+        query: str,
+        k: int = 5,
+        index_dir: str = "data/processed",
+        no_cache: bool = False,
+        cache_dir: str = "data/cache",
     ) -> None:
         """Answer a single query using the retrieved context."""
         query = _check_query(query)
         k = _check_k(k)
-        hits = Retriever(index_dir).search(query, k)
+        cache = _make_cache(no_cache, cache_dir)
+        retriever = Retriever(index_dir, cache)
+        hits = retriever.search(query, k)
         if not hits:
             print("No relevant context found for this question.")
             return
@@ -214,13 +287,17 @@ class Arguments:
                 for c in hits
             ]
         )
-        from .llm import LLM
-
-        print(LLM().ask_llm(question=query, context=context))
+        llm = LLM(cache=cache)
+        print(llm.ask_llm(question=query, context=context))
+        _report(retriever, llm)
 
     @_safe
     def answer_dataset(
-        self, student_search_results_path: str, save_directory: str
+        self,
+        student_search_results_path: str,
+        save_directory: str,
+        no_cache: bool = False,
+        cache_dir: str = "data/cache",
     ) -> None:
         """Generate answers from a StudentSearchResults JSON file."""
         path = _check_json(
@@ -230,9 +307,7 @@ class Arguments:
         with open(path, encoding="utf-8") as f:
             student = StudentSearchResults.model_validate(json.load(f))
 
-        from .llm import LLM
-
-        llm = LLM()
+        llm = LLM(cache=_make_cache(no_cache, cache_dir))
         utils = Utils()
         cache: Dict[str, Optional[str]] = {}
 
@@ -285,6 +360,13 @@ class Arguments:
             os.path.basename(path),
         )
         print(f"Saved student_search_results_and_answer to {out}")
+        _report(llm=llm)
+
+    @_safe
+    def clear_cache(self, cache_dir: str = "data/cache") -> None:
+        """Delete every cached file (index blobs, searches, answers)."""
+        count = DiskCache(_check_dir(cache_dir, "cache_dir")).clear()
+        print(f"Cache cleared ({count} file(s) removed)")
 
     @_safe
     def evaluate(
