@@ -2,7 +2,7 @@ USER_NAME := $(shell whoami)
 export UV_CACHE_DIR = /goinfre/$(USER_NAME)/.cache/uv
 export HF_HOME = /goinfre/$(USER_NAME)/.cache/huggingface
 
-KEEP = .git .gitignore README.md uv.lock \
+KEEP = .git .gitignore README.md uv.lock cache.py\
 		pyproject.toml Makefile needed.md src __init__.py\
 		UnansweredQuestions AnsweredQuestions data raw datasets\
 		cli.py models.py utils.py __main__.py vllm-0.10.1 llm.py\
