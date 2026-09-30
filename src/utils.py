@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import bm25s
 from langchain_core.documents import Document
@@ -28,6 +28,42 @@ STOPWORDS = frozenset(
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _HEADER_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$")
+
+MAX_CONTEXT_CHARS = 9000
+
+
+def build_context(blocks: List[Tuple[str, str]]) -> str:
+    """Format snippets for the prompt within a character budget.
+
+    Args:
+        blocks: ``(label, text)`` pairs, best first.
+
+    Returns:
+        The context string sent to the LLM.
+    """
+    parts: List[str] = []
+    used = 0
+    for i, (label, text) in enumerate(blocks, 1):
+        room = MAX_CONTEXT_CHARS - used
+        if room <= 200:
+            break
+        snippet = text[:room]
+        parts.append(f"[{i}] {label}\n{snippet}")
+        used += len(snippet)
+    return "\n\n---\n\n".join(parts)
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON through a temp file so readers never see a partial file.
+
+    Args:
+        path: Destination file.
+        data: JSON-serialisable content.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def tokenize(text: str) -> List[str]:
@@ -280,13 +316,14 @@ class Utils:
         out = Path(index_dir)
         out.mkdir(parents=True, exist_ok=True)
         bm25.save(str(out))
-        with open(out / "chunks.json", "w", encoding="utf-8") as f:
-            json.dump([c.model_dump() for c in chunks], f,
-                      ensure_ascii=False)
-        with open(out / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {"max_chunk_size": max_chunk_size, "files": hashes}, f
-            )
+        _write_json_atomic(
+            out / "chunks.json", [c.model_dump() for c in chunks]
+        )
+        # written last: a new manifest means a complete new index
+        _write_json_atomic(
+            out / "manifest.json",
+            {"max_chunk_size": max_chunk_size, "files": hashes},
+        )
 
     def build_index(
         self, raw_dir: str, index_dir: str, max_chunk_size: int
@@ -399,12 +436,15 @@ class Retriever:
         self,
         index_dir: str = "data/processed",
         cache: Optional[DiskCache] = None,
+        mmap: bool = True,
     ) -> None:
         """Load the index once.
 
         Args:
             index_dir: Directory written by ``Utils.build_index``.
             cache: Optional cache (fast chunk loading + query results).
+            mmap: Memory-map the BM25 arrays (fast cold start). Use False
+                in a long-running server that may rewrite the index.
 
         Raises:
             FileNotFoundError: If the index does not exist.
@@ -421,7 +461,7 @@ class Retriever:
         self.version = index_version(path)
         self.chunks = self._load_chunks(path)
         try:
-            self.bm25 = bm25s.BM25.load(str(path), mmap=True)
+            self.bm25 = bm25s.BM25.load(str(path), mmap=mmap)
         except (OSError, ValueError):
             self.bm25 = bm25s.BM25.load(str(path))
 

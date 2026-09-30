@@ -22,11 +22,14 @@ from .models import (
     StudentSearchResults,
     StudentSearchResultsAndAnswer,
 )
-from .utils import Retriever, Utils
+from .utils import Retriever, Utils, build_context
+
+import uvicorn
+
+from .server import create_app
 
 P = ParamSpec("P")
 
-MAX_CONTEXT_CHARS = 9000
 IOU_THRESHOLD = 0.05
 
 
@@ -121,20 +124,6 @@ def _save(model: BaseModel, directory: str, basename: str) -> Path:
     return out_path
 
 
-def _build_context(blocks: List[Tuple[str, str]]) -> str:
-    """Format snippets for the prompt within a character budget."""
-    parts: List[str] = []
-    used = 0
-    for i, (label, text) in enumerate(blocks, 1):
-        room = MAX_CONTEXT_CHARS - used
-        if room <= 200:
-            break
-        snippet = text[:room]
-        parts.append(f"[{i}] {label}\n{snippet}")
-        used += len(snippet)
-    return "\n\n---\n\n".join(parts)
-
-
 def _iou(a: MinimalSource, b: MinimalSource) -> float:
     """Intersection over union of two character ranges."""
     inter = min(a.last_character_index, b.last_character_index) - max(
@@ -199,7 +188,7 @@ class Arguments:
     @_safe
     def search(
         self,
-        query: str,
+        query: str | None = None,
         k: int = 10,
         index_dir: str = "data/processed",
         no_cache: bool = False,
@@ -277,7 +266,7 @@ class Arguments:
         if not hits:
             print("No relevant context found for this question.")
             return
-        context = _build_context(
+        context = build_context(
             [
                 (
                     f"{c.source} [{c.first_character_index}:"
@@ -340,7 +329,7 @@ class Arguments:
                     )
             if blocks:
                 reply = llm.ask_llm(
-                    question=res.question, context=_build_context(blocks)
+                    question=res.question, context=build_context(blocks)
                 )
             else:
                 reply = "No relevant context found for this question."
@@ -361,6 +350,33 @@ class Arguments:
         )
         print(f"Saved student_search_results_and_answer to {out}")
         _report(llm=llm)
+
+    @_safe
+    def serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        index_dir: str = "data/processed",
+        no_cache: bool = False,
+        cache_dir: str = "data/cache",
+        raw_dir: str = "data/raw",
+    ) -> None:
+        """Start the local HTTP API (FastAPI + uvicorn)."""
+        if not isinstance(host, str) or not host:
+            raise ValueError("host must be a non-empty string")
+        if isinstance(port, bool) or not isinstance(port, int) or not (
+            0 < port < 65536
+        ):
+            raise ValueError("port must be an integer between 1 and 65535")
+        _check_dir(index_dir, "index_dir")
+        _check_dir(cache_dir, "cache_dir")
+        _check_dir(raw_dir, "raw_dir")
+
+        uvicorn.run(
+            create_app(index_dir, cache_dir, no_cache, raw_dir),
+            host=host,
+            port=port,
+        )
 
     @_safe
     def clear_cache(self, cache_dir: str = "data/cache") -> None:
