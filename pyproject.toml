@@ -1,0 +1,32 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Build a Retrieval-Augmented Generation system that answers questions about codebases by retrieving relevant information and generating evidence-based responses, implementing intelligent chunking, efficient retrieval (TF-IDF/BM25)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bm25s>=0.3.11",
+    "fire>=0.7.1",
+    "flake8>=7.3.0",
+    "huggingface-hub>=1.32.0",
+    "langchain>=1.4.0",
+    "langchain-community>=0.4.2",
+    "langchain-ollama>=1.1.0",
+    "llama-cpp-python>=0.3.35",
+    "markdown>=3.10.3",
+    "mypy>=2.3.1",
+    "numpy>=2.2.6",
+    "pqdm>=0.2.0",
+    "pydantic>=2.13.5",
+    "stubs>=1.0.0",
+    "tqdm>=4.70.1",
+    "types-tqdm>=4.70.0.20260906",
+    "unstructured>=0.18.32",
+]
+
+[[tool.mypy.overrides]]
+module = "fire.*"
+ignore_missing_imports = true
+[tool.mypy]
+disable_error_code = ["import-untyped"]
+ignore_missing_imports = true
