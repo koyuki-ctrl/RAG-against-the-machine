@@ -18,6 +18,9 @@ from tqdm import tqdm
 
 from .cache import DiskCache, index_version, make_key
 from .models import IndexedChunk
+from langchain_chroma import Chroma
+from .embedding import GGUFEmbeddings
+
 
 STOPWORDS = frozenset(
     "a an and are as at be but by for from has have how i if in into is "
@@ -256,6 +259,24 @@ class Utils:
                 )
         return chunks
 
+    def chunks_to_documents(
+            self, chunks: List[IndexedChunk]
+    ) -> List[Document]:
+        """Convert internal chunks to LangChain Documents (with metadata)."""
+        return [
+            Document(
+                page_content=c.text,
+                metadata={
+                    "source": c.source,
+                    "first_character_index": c.first_character_index,
+                    "last_character_index": c.last_character_index,
+                    "extension": c.extension,
+                    "breadcrumb": c.breadcrumb,
+                },
+            )
+            for c in chunks
+        ]
+
     @staticmethod
     def file_hash(path: str) -> str:
         """Compute the SHA-256 of a file (used to detect changes).
@@ -272,7 +293,7 @@ class Utils:
                 digest.update(block)
         return digest.hexdigest()
 
-    def _hash_files(self, files: List[str]) -> Dict[str, str]:
+    def hash_files(self, files: List[str]) -> Dict[str, str]:
         """Hash every file, skipping the unreadable ones.
 
         Args:
@@ -341,7 +362,7 @@ class Utils:
         files = self.list_valid_path(raw_dir, ".txt", ".md", ".py")
         if not files:
             raise FileNotFoundError(f"No .txt/.md/.py file in {raw_dir}")
-        hashes = self._hash_files(files)
+        hashes = self.hash_files(files)
         chunks = self.documents_chunkers(list(hashes), max_chunk_size)
         if not chunks:
             raise ValueError("The corpus produced no chunk")
@@ -389,7 +410,7 @@ class Utils:
             size = max_chunk_size
 
         files = self.list_valid_path(raw_dir, ".txt", ".md", ".py")
-        new_hashes = self._hash_files(files)
+        new_hashes = self.hash_files(files)
         added = [f for f in new_hashes if f not in old_hashes]
         modified = [
             f for f in new_hashes
@@ -525,3 +546,97 @@ class Retriever:
         if self.cache is not None:
             self._memory[key] = ids
         return [self.chunks[i] for i in ids]
+
+
+class SemanticRetriever:
+    """Semantic retriever over a persisted Chroma collection.
+
+    Exposes the same interface as ``Retriever`` so callers (CLI,
+    server) can swap one for the other transparently.
+    """
+
+    def __init__(
+        self,
+        index_dir: str = "data/processed",
+        collection_name: str = "semantic_chunks",
+        cache: Optional[DiskCache] = None,
+        embeddings: Optional[GGUFEmbeddings] = None,
+    ) -> None:
+        """Open the collection and prepare the embedding model.
+
+        Args:
+            index_dir: Directory written by the semantic ``index``.
+            collection_name: Chroma collection name.
+            cache: Optional cache (query results).
+            embeddings: Optional pre-built embedding model to reuse.
+        """
+        path = Path(index_dir)
+        if not path.is_dir():
+            raise FileNotFoundError(
+                f"No semantic index in {index_dir}: "
+                f"run 'index --mode semantic' first"
+            )
+        self.cache = cache
+        self.hits = 0
+        self.misses = 0
+        self._memory: Dict[str, List[str]] = {}
+        self.embeddings = embeddings or GGUFEmbeddings()
+        self.store = Chroma(
+            persist_directory=index_dir,
+            embedding_function=self.embeddings,
+            collection_name=collection_name,
+        )
+        self.version = (
+            f"{self.store._collection.name}-{self.store._collection.count()}"
+        )
+
+    def search(self, query: str, k: int) -> List[IndexedChunk]:
+        """Return the top-k most similar chunks.
+
+        Args:
+            query: Natural-language question.
+            k: Number of chunks wanted.
+
+        Returns:
+            Chunks ranked by decreasing similarity (may be empty).
+        """
+        key = make_key(self.version, str(k), " ".join(query.lower().split()))
+        ids: Optional[List[str]] = None
+
+        if self.cache is not None:
+            ids = self._memory.get(key)
+            if ids is None:
+                stored = self.cache.get(key)
+                if isinstance(stored, list) and all(
+                    isinstance(i, str) for i in stored
+                ):
+                    ids = stored
+
+        if ids is not None:
+            self.hits += 1
+            docs = self.store.get_by_ids(ids) if ids else []
+        else:
+            self.misses += 1
+            result = self.store.similarity_search_with_score(query, k=k)
+            docs = [doc for doc, _score in result]
+            if self.cache is not None:
+                ids = [d.id for d in docs if d.id is not None]
+                self.cache.set(key, ids)
+
+        if self.cache is not None:
+            self._memory[key] = ids or []
+
+        return [self._to_chunk(d) for d in docs]
+
+    @staticmethod
+    def _to_chunk(doc: Document) -> IndexedChunk:
+        """Rebuild an IndexedChunk from a Chroma Document."""
+        m = doc.metadata
+        return IndexedChunk(
+            source=m["source"],
+            first_character_index=int(m["first_character_index"]),
+            last_character_index=int(m["last_character_index"]),
+            extension=m.get("extension", ""),
+            breadcrumb=m.get("breadcrumb", ""),
+            text=doc.page_content,
+        )

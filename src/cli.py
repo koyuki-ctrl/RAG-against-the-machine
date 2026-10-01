@@ -7,10 +7,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, ParamSpec, Tuple
-
 from pydantic import BaseModel
 from tqdm import tqdm
-
 from .cache import DiskCache
 from .llm import LLM
 from .models import (
@@ -22,11 +20,11 @@ from .models import (
     StudentSearchResults,
     StudentSearchResultsAndAnswer,
 )
-from .utils import Retriever, Utils, build_context
-
-import uvicorn
-
+from .utils import Retriever, Utils, build_context, SemanticRetriever
 from .server import create_app
+from langchain_chroma import Chroma
+from .embedding import GGUFEmbeddings, ProgressEmbeddings
+import uvicorn
 
 P = ParamSpec("P")
 
@@ -146,18 +144,74 @@ class Arguments:
     def index(
         self,
         max_chunk_size: int = 2000,
-        raw_dir: str = "data/raw",
-        index_dir: str = "data/processed",
+        mode: str = "lexical"
     ) -> None:
         """Ingest ``raw_dir`` and build the BM25 index in ``index_dir``."""
+        raw_dir: str = "data/raw"
+        index_dir: str = "data/processed"
         _check_chunk_size(max_chunk_size)
         _check_dir(raw_dir, "raw_dir")
         _check_dir(index_dir, "index_dir")
-        count = Utils().build_index(raw_dir, index_dir, max_chunk_size)
-        print(
-            f"Ingestion complete! Indexed {count} chunks under "
-            f"{index_dir.rstrip('/')}/"
-        )
+        if mode == "lexical":
+            count = Utils().build_index(raw_dir, index_dir, max_chunk_size)
+            print(
+                f"Ingestion complete! Indexed {count} chunks under "
+                f"{index_dir.rstrip('/')}/"
+            )
+        elif mode == "semantic":
+            files = Utils().list_valid_path(raw_dir, ".txt", ".md", ".py")
+            if not files:
+                raise FileNotFoundError(f"No .txt/.md/.py file in {raw_dir}")
+
+            hashes = Utils().hash_files(files)
+            chunks = Utils().documents_chunkers(list(hashes), max_chunk_size)
+            if not chunks:
+                raise ValueError("The corpus produced no chunk")
+
+            documents = Utils().chunks_to_documents(chunks)
+
+            embeddings = ProgressEmbeddings(
+                GGUFEmbeddings(
+                    repo_id="huoxu/all-MiniLM-L6-v2-Q8_0-GGUF",
+                    filename="*q8_0.gguf",
+                ),
+                total=len(chunks),
+                desc="Embedding",
+            )
+
+            store = Chroma(
+                embedding_function=embeddings,
+                persist_directory=index_dir,
+                collection_name="semantic_chunks",
+            )
+
+            BATCH = 64
+            try:
+                for i in range(0, len(documents), BATCH):
+                    store.add_documents(documents[i: i + BATCH])
+            finally:
+                embeddings.close()
+
+            print(
+                f"Ingestion complete! Indexed {len(chunks)} chunks "
+                f"(semantic) under {index_dir.rstrip('/')}/"
+            )
+        else:
+            raise ValueError("mode not valid")
+
+    def _make_retriever(
+        self,
+        mode: str,
+        index_dir: str,
+        cache: Optional[DiskCache],
+    ) -> Any:
+        """Instantiate the right retriever for the requested mode."""
+        mode = (mode or "lexical").lower()
+        if mode == "lexical":
+            return Retriever(index_dir, cache)
+        if mode == "semantic":
+            return SemanticRetriever(index_dir, cache=cache)
+        raise ValueError(f"Unknown retrieval mode: {mode!r}")
 
     @_safe
     def update(
@@ -191,13 +245,16 @@ class Arguments:
         query: str | None = None,
         k: int = 10,
         index_dir: str = "data/processed",
+        mode: str = "lexical",
         no_cache: bool = False,
         cache_dir: str = "data/cache",
     ) -> None:
         """Print the top-k sources for a single query."""
         query = _check_query(query)
         k = _check_k(k)
-        retriever = Retriever(index_dir, _make_cache(no_cache, cache_dir))
+        retriever = self._make_retriever(
+            mode, index_dir, _make_cache(no_cache, cache_dir)
+        )
         for c in retriever.search(query, k):
             print(
                 f"{c.source} "
@@ -254,6 +311,7 @@ class Arguments:
         query: str,
         k: int = 5,
         index_dir: str = "data/processed",
+        mode: str = "lexical",
         no_cache: bool = False,
         cache_dir: str = "data/cache",
     ) -> None:
@@ -261,11 +319,14 @@ class Arguments:
         query = _check_query(query)
         k = _check_k(k)
         cache = _make_cache(no_cache, cache_dir)
-        retriever = Retriever(index_dir, cache)
+        retriever = self._make_retriever(mode, index_dir, cache)
+
         hits = retriever.search(query, k)
         if not hits:
             print("No relevant context found for this question.")
+            _report(retriever)
             return
+
         context = build_context(
             [
                 (
@@ -276,6 +337,7 @@ class Arguments:
                 for c in hits
             ]
         )
+
         llm = LLM(cache=cache)
         print(llm.ask_llm(question=query, context=context))
         _report(retriever, llm)

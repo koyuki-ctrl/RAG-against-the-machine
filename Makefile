@@ -4,8 +4,8 @@ export HF_HOME = /goinfre/$(USER_NAME)/.cache/huggingface
 
 KEEP = .git .gitignore README.md uv.lock cache.py\
 		pyproject.toml Makefile needed.md src __init__.py\
-		UnansweredQuestions AnsweredQuestions data raw datasets\
 		cli.py models.py utils.py __main__.py vllm-0.10.1 llm.py server.py\
+		UnansweredQuestions AnsweredQuestions data raw datasets embedding.py\
 
 ARG ?= ""
 VENV_DIR = .venv
